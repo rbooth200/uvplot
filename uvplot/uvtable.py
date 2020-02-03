@@ -403,7 +403,7 @@ class UVTable(object):
 
         return self._uvdist
 
-    def uvbin(self, uvbin_size, **kwargs):
+    def uvbin(self, uvbin_size, use_std=False):
         """
         Compute the intervals (bins) of the uv-distances given the size of the bin (bin_size_wle).
 
@@ -417,29 +417,74 @@ class UVTable(object):
         To compute the weights, we do not need to divide by the weight_corr factor since it cancels out when we compute
 
         """
-        self.nbins = np.ceil(self.uvdist.max() / uvbin_size).astype('int')
+        uvdist = self.uvdist # Cache as its a property
+        self.nbins = np.ceil(uvdist.max() / uvbin_size).astype('int')
         self.bin_uvdist = np.zeros(self.nbins)
         self.bin_weights = np.zeros(self.nbins)
         self.bin_count = np.zeros(self.nbins, dtype='int')
-        self.uv_intervals = []
 
         self.uv_bin_edges = np.arange(self.nbins + 1, dtype='float64') * uvbin_size
 
-        for i in range(self.nbins):
-            uv_interval = np.where((self.uvdist >= self.uv_bin_edges[i]) &
-                                   (self.uvdist < self.uv_bin_edges[i + 1]))
-            self.bin_count[i] = len(uv_interval[0])
 
-            if self.bin_count[i] != 0:
-                self.bin_uvdist[i] = self.uvdist[uv_interval].sum() / self.bin_count[i]
-                self.bin_weights[i] = np.sum(self.weights[uv_interval])
-            else:
-                self.bin_uvdist[i] = self.uv_bin_edges[i] + 0.5 * uvbin_size
+        # Pre-compute the bins each data point falls into
+        norm = 1 / uvbin_size
+        self.bin_index = np.floor(uvdist * norm).astype('int32')
+        # Increment to make sure that only the last bin includes the upper edge
+        increment = ((uvdist == self.uv_bin_edges[self.bin_index+1]) & 
+                     (self.bin_index+1 != self.nbins))
+        self.bin_index[increment] += 1
 
-            self.uv_intervals.append(uv_interval)
 
-        self.bin_re, self.bin_re_err = self.bin_quantity(self.re, **kwargs)
-        self.bin_im, self.bin_im_err = self.bin_quantity(self.im, **kwargs)
+        # Setup the data arrays
+        self.bin_re = np.zeros(self.nbins, dtype='float64')
+        self.bin_re_err = np.zeros(self.nbins, dtype='float64')
+
+        self.bin_im = np.zeros(self.nbins, dtype='float64')
+        self.bin_im_err = np.zeros(self.nbins, dtype='float64')
+
+
+        # Use blocking since its faster and needs less memory
+        BLOCK = 65536
+        for i in range(0, len(uvdist), BLOCK):
+            tmp_uv = uvdist[i:i+BLOCK]
+            tmp_re = self.re[i:i+BLOCK]
+            tmp_im = self.im[i:i+BLOCK]
+            tmp_w = self.weights[i:i+BLOCK]
+
+            idx = self.bin_index[i:i+BLOCK]
+
+            self.bin_count += np.bincount(idx, minlength=self.nbins)
+
+            self.bin_uvdist += np.bincount(idx, weights=tmp_w*tmp_uv, 
+                                           minlength=self.nbins)
+
+            self.bin_re += np.bincount(idx, weights=tmp_w*tmp_re, 
+                                       minlength=self.nbins)
+            self.bin_im += np.bincount(idx, weights=tmp_w*tmp_im, 
+                                       minlength=self.nbins)
+
+            self.bin_weights += np.bincount(idx, weights=tmp_w,
+                                            minlength=self.nbins)
+
+            if use_std:
+                self.bin_re_err += np.bincount(idx, weights=tmp_w*tmp_re**2,
+                                               minlength=self.nbins)                           
+                self.bin_im_err += np.bincount(idx, weights=tmp_w*tmp_im**2,
+                                               minlength=self.nbins)
+
+        idx = self.bin_count > 0
+        w = self.bin_weights[idx]
+        self.bin_re[idx] /= w
+        self.bin_im[idx] /= w
+        self.bin_uvdist[idx] /= w 
+        if use_std:
+            self.bin_re_err[idx] /= w
+            self.bin_im_err[idx] /= w
+            self.bin_re_err = np.sqrt(bin_re_err - bin_re**2)
+            self.bin_im_err = np.sqrt(bin_im_err - bin_im**2)
+        else:
+            self.bin_re_err[idx] = 1 / np.sqrt(w)
+            self.bin_im_err[idx] = 1 / np.sqrt(w)
 
     def bin_quantity(self, x, use_std=False):
         """
@@ -460,17 +505,30 @@ class UVTable(object):
 
         """
         bin_x, bin_x_err = np.zeros(self.nbins), np.zeros(self.nbins)
+        
+        # Use blocking since its faster and needs less memory
+        BLOCK = 65536
+        for i in range(0, len(self.u), BLOCK):
+            tmp_x = x[i:i+BLOCK]
+            tmp_w = self.weights[i:i+BLOCK]
 
-        for i in range(self.nbins):
+            idx =  self.bin_index[i:i+BLOCK]
 
-            if self.bin_count[i] != 0:
-                bin_x[i] = np.sum(x[self.uv_intervals[i]] * self.weights[self.uv_intervals[i]]) / \
-                           self.bin_weights[i]
-
-                if use_std is True:
-                    bin_x_err[i] = np.std(x[self.uv_intervals[i]])
-                else:
-                    bin_x_err[i] = 1. / np.sqrt(self.bin_weights[i])
+            bin_x += np.bincount(idx, weights=tmp_w*tmp_x,
+                                minlength=self.nbins)     
+            
+            if use_std:
+                bin_x_err += np.bincount(idx, weights=tmp_w*tmp_x**2,
+                                         minlength=self.nbins)     
+        
+        idx = self.bin_count > 0
+        w = self.bin_weights[idx]
+        bin_x[idx] /= w
+        if use_std:
+            bin_x_err[idx] /= w
+            bin_x_err = np.sqrt(bin_x_err - bin_x**2)
+        else:
+            bin_x_err[idx] = 1 / np.sqrt(w)
 
         return bin_x, bin_x_err
 

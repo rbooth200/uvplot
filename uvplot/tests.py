@@ -84,3 +84,31 @@ def test_uvcut():
     assert_allclose(uvt.weights, uv.weights[uvcut])
 
     assert uv.header == uvt.header
+
+
+def test_uvbin():
+    uvtable_filename= "/tmp/uvtable.txt"
+    uvtable, wle = create_sample_uvtable(uvtable_filename)
+
+    uv = UVTable(filename=uvtable_filename, wle=wle, columns=COLUMNS_V0)
+
+    uvbin_size = 5e4
+    uvmin = 3e6
+    uvmax = uvmin + uvbin_size
+
+    uv.uvbin(uvbin_size)
+
+    # Check contents of each uvbin agrees with bin_quantity
+    bin_re, bin_re_err = uv.bin_quantity(uv.re)
+
+    assert_allclose(bin_re, uv.bin_re)
+    assert_allclose(bin_re_err, uv.bin_re_err)
+
+    # Check the contents of one bin is correct
+    idx = (uv.uvdist >= uvmin) & (uv.uvdist < uvmax)
+
+    if np.sum(idx > 0):
+        assert np.all(uv.bin_index[idx] == uv.bin_index[idx][0])
+
+    id_bin = (uv.bin_uvdist >= uvmin) & (uv.bin_uvdist < uvmax)
+    assert np.sum(idx) == np.sum(uv.bin_count[id_bin])
